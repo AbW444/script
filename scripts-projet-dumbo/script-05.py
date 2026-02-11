@@ -15,12 +15,20 @@ Architecture (7 stages):
 Key difference from previous version:
   - OLD: frame * soft_mask  -> degrades ALL creature pixels
   - NEW: np.where(mask, original, black) -> creature pixels EXACT originals
+
+Performance:
+  - Scenes processed in parallel via ProcessPoolExecutor
+  - Frames within each scene processed in parallel via ThreadPoolExecutor
+    (cv2 and numpy release the GIL, giving true concurrency)
+  - Temporal smoothing (--temporal_window > 1) forces sequential frame order
 """
 
 import argparse
 import os
+import threading
 from collections import deque
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed)
 from pathlib import Path
 
 import cv2
@@ -270,8 +278,190 @@ def composite_on_black(frame, mask_float):
 
 
 # ---------------------------------------------------------------------------
+# Single-Frame Processing (thread-safe when temporal_window == 1)
+# ---------------------------------------------------------------------------
+
+def _process_one_frame(fp, out_fp, bg_small_blur, scale, full_size,
+                       w_det, h_det, args, debug_state):
+    """
+    Process a single frame through stages 2-7.  Thread-safe.
+    debug_state = (threading.Lock, [bool]) or None.
+    Returns True if frame was written.
+    """
+    frame = read_bgr(fp)
+    if frame is None:
+        return False
+
+    H0, W0 = full_size
+
+    # Downscale for mask computation
+    if scale != 1.0:
+        frame_small = cv2.resize(frame, (w_det, h_det),
+                                 interpolation=cv2.INTER_AREA)
+    else:
+        frame_small = frame
+
+    # ---- Stage 2: Hysteresis thresholding ----
+    diff = cv2.absdiff(frame_small, bg_small_blur)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    diff_gray = cv2.GaussianBlur(diff_gray, (0, 0), 1.0)
+
+    mask = hysteresis_threshold(diff_gray,
+                                t_high=args.t_high,
+                                t_low=args.t_low)
+
+    # ---- Stage 3: Particle removal ----
+    mask = filter_particles(mask,
+                            min_area=args.min_area,
+                            max_components=args.max_blobs)
+
+    # ---- Stage 5: Morphological cleanup ----
+    mask = morphological_cleanup(mask, close_ksize=args.close_ksize)
+    mask = fill_holes(mask)
+
+    # Safety dilation: ensure mask fully covers creature
+    if args.dilate_px > 0:
+        ks = args.dilate_px * 2 + 1
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+        mask = cv2.dilate(mask, k, iterations=1)
+
+    # ---- Upscale mask to full resolution ----
+    if scale != 1.0:
+        mask_full = cv2.resize(mask, (W0, H0),
+                               interpolation=cv2.INTER_NEAREST)
+    else:
+        mask_full = mask
+
+    # ---- Stage 6: Feathering ----
+    if args.use_guided_filter:
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mask_float = feather_inward_guided(
+            mask_full, frame_gray,
+            radius=args.guided_radius,
+            eps=args.guided_eps,
+            feather_px=args.feather_px)
+    else:
+        mask_float = feather_inward(mask_full,
+                                    feather_px=args.feather_px)
+
+    # ---- Stage 7: Lossless compositing ----
+    out = composite_on_black(frame, mask_float)
+    cv2.imwrite(str(out_fp), out)
+
+    # ---- Debug output (first frame only, thread-safe) ----
+    if args.debug and debug_state is not None:
+        lock, done_flag = debug_state
+        if not done_flag[0]:
+            with lock:
+                if not done_flag[0]:
+                    out_dir = out_fp.parent
+                    cv2.imwrite(str(out_dir / "_dbg_01_diff.png"),
+                                diff_gray)
+                    cv2.imwrite(str(out_dir / "_dbg_02_hysteresis.png"),
+                                mask)
+                    cv2.imwrite(str(out_dir / "_dbg_03_mask_full.png"),
+                                mask_full)
+                    soft_vis = (mask_float * 255).astype(np.uint8)
+                    cv2.imwrite(str(out_dir / "_dbg_04_feather.png"),
+                                soft_vis)
+                    done_flag[0] = True
+
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Scene Processing
 # ---------------------------------------------------------------------------
+
+def _process_scene_sequential(work, bg_small_blur, scale, full_size,
+                              w_det, h_det, args, out_scene_path,
+                              show_progress):
+    """
+    Sequential frame processing - required when temporal_window > 1
+    because temporal smoothing needs ordered frame history.
+    """
+    prev_masks = deque(maxlen=args.temporal_window)
+    processed = 0
+
+    iterator = (tqdm(work, desc=out_scene_path.name, leave=False)
+                if show_progress else work)
+
+    H0, W0 = full_size
+
+    for fp, out_fp in iterator:
+        frame = read_bgr(fp)
+        if frame is None:
+            continue
+
+        if scale != 1.0:
+            frame_small = cv2.resize(frame, (w_det, h_det),
+                                     interpolation=cv2.INTER_AREA)
+        else:
+            frame_small = frame
+
+        diff = cv2.absdiff(frame_small, bg_small_blur)
+        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        diff_gray = cv2.GaussianBlur(diff_gray, (0, 0), 1.0)
+
+        mask = hysteresis_threshold(diff_gray,
+                                    t_high=args.t_high,
+                                    t_low=args.t_low)
+
+        mask = filter_particles(mask,
+                                min_area=args.min_area,
+                                max_components=args.max_blobs)
+
+        # ---- Stage 4: Temporal smoothing ----
+        prev_masks.append(mask.copy())
+        if len(prev_masks) >= 2:
+            stack = np.stack(list(prev_masks), axis=0).astype(
+                np.float32) / 255.0
+            vote = np.mean(stack, axis=0)
+            mask = (vote >= args.temporal_thresh).astype(
+                np.uint8) * 255
+
+        mask = morphological_cleanup(mask, close_ksize=args.close_ksize)
+        mask = fill_holes(mask)
+
+        if args.dilate_px > 0:
+            ks = args.dilate_px * 2 + 1
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+            mask = cv2.dilate(mask, k, iterations=1)
+
+        if scale != 1.0:
+            mask_full = cv2.resize(mask, (W0, H0),
+                                   interpolation=cv2.INTER_NEAREST)
+        else:
+            mask_full = mask
+
+        if args.use_guided_filter:
+            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mask_float = feather_inward_guided(
+                mask_full, frame_gray,
+                radius=args.guided_radius,
+                eps=args.guided_eps,
+                feather_px=args.feather_px)
+        else:
+            mask_float = feather_inward(mask_full,
+                                        feather_px=args.feather_px)
+
+        out = composite_on_black(frame, mask_float)
+        cv2.imwrite(str(out_fp), out)
+        processed += 1
+
+        if args.debug and processed == 1:
+            cv2.imwrite(str(out_scene_path / "_dbg_01_diff.png"),
+                        diff_gray)
+            cv2.imwrite(str(out_scene_path / "_dbg_02_hysteresis.png"),
+                        mask)
+            cv2.imwrite(str(out_scene_path / "_dbg_03_mask_full.png"),
+                        mask_full)
+            soft_vis = (mask_float * 255).astype(np.uint8)
+            cv2.imwrite(str(out_scene_path / "_dbg_04_feather.png"),
+                        soft_vis)
+
+    return processed
+
 
 def process_scene(scene_path, out_scene_path, args, show_progress=True):
     """Process all frames in a single scene directory."""
@@ -290,7 +480,6 @@ def process_scene(scene_path, out_scene_path, args, show_progress=True):
     if bg_small is None:
         return 0
 
-    H0, W0 = full_size
     h_det, w_det = bg_small.shape[:2]
 
     # Smooth background for stable diff
@@ -298,106 +487,49 @@ def process_scene(scene_path, out_scene_path, args, show_progress=True):
 
     step = max(1, args.step)
     indices = list(range(0, len(frames_all), step))
-    processed = 0
 
-    # Temporal buffer
-    prev_masks = deque(maxlen=args.temporal_window)
-
-    iterator = tqdm(indices, desc=scene_path.name, leave=False) \
-               if show_progress else indices
-
-    for idx in iterator:
+    # Build work list (skip existing unless --overwrite)
+    work = []
+    for idx in indices:
         fp = frames_all[idx]
         out_fp = out_scene_path / fp.name
-
         if out_fp.exists() and not args.overwrite:
             continue
+        work.append((fp, out_fp))
 
-        frame = read_bgr(fp)
-        if frame is None:
-            continue
+    if not work:
+        return 0
 
-        # Downscale for mask computation
-        if scale != 1.0:
-            frame_small = cv2.resize(frame, (w_det, h_det),
-                                     interpolation=cv2.INTER_AREA)
-        else:
-            frame_small = frame
+    # ---- Temporal smoothing forces sequential order ----
+    if args.temporal_window > 1:
+        return _process_scene_sequential(
+            work, bg_small_blur, scale, full_size,
+            w_det, h_det, args, out_scene_path, show_progress)
 
-        # ---- Stage 2: Hysteresis thresholding ----
-        diff = cv2.absdiff(frame_small, bg_small_blur)
-        diff_gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-        diff_gray = cv2.GaussianBlur(diff_gray, (0, 0), 1.0)
+    # ---- Parallel frame processing (default path) ----
+    debug_state = (threading.Lock(), [False]) if args.debug else None
+    processed = 0
+    fw = max(1, args.frame_workers)
 
-        mask = hysteresis_threshold(diff_gray,
-                                    t_high=args.t_high,
-                                    t_low=args.t_low)
+    with ThreadPoolExecutor(max_workers=fw) as pool:
+        futures = {
+            pool.submit(_process_one_frame, fp, out_fp,
+                        bg_small_blur, scale, full_size,
+                        w_det, h_det, args, debug_state): fp.name
+            for fp, out_fp in work
+        }
 
-        # ---- Stage 3: Particle removal ----
-        mask = filter_particles(mask,
-                                min_area=args.min_area,
-                                max_components=args.max_blobs)
+        iterator = (tqdm(as_completed(futures), total=len(futures),
+                         desc=scene_path.name, leave=False)
+                    if show_progress else as_completed(futures))
 
-        # ---- Stage 4: Temporal smoothing (optional) ----
-        if args.temporal_window > 1:
-            prev_masks.append(mask.copy())
-            if len(prev_masks) >= 2:
-                stack = np.stack(list(prev_masks), axis=0).astype(
-                    np.float32) / 255.0
-                vote = np.mean(stack, axis=0)
-                mask = (vote >= args.temporal_thresh).astype(
-                    np.uint8) * 255
-
-        # ---- Stage 5: Morphological cleanup ----
-        mask = morphological_cleanup(mask, close_ksize=args.close_ksize)
-        mask = fill_holes(mask)
-
-        # Safety dilation: ensure mask fully covers creature
-        if args.dilate_px > 0:
-            ks = args.dilate_px * 2 + 1
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
-            mask = cv2.dilate(mask, k, iterations=1)
-
-        # ---- Upscale mask to full resolution ----
-        if scale != 1.0:
-            mask_full = cv2.resize(mask, (W0, H0),
-                                   interpolation=cv2.INTER_NEAREST)
-        else:
-            mask_full = mask
-
-        # ---- Stage 6: Feathering ----
-        if args.use_guided_filter:
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            mask_float = feather_inward_guided(
-                mask_full, frame_gray,
-                radius=args.guided_radius,
-                eps=args.guided_eps,
-                feather_px=args.feather_px)
-        else:
-            mask_float = feather_inward(mask_full,
-                                        feather_px=args.feather_px)
-
-        # ---- Stage 7: Lossless compositing ----
-        out = composite_on_black(frame, mask_float)
-
-        cv2.imwrite(str(out_fp), out)
-        processed += 1
-
-        # ---- Debug output (first processed frame only) ----
-        if args.debug and processed == 1:
-            # Diff at detect resolution
-            cv2.imwrite(str(out_scene_path / "_dbg_01_diff.png"),
-                        diff_gray)
-            # Mask after hysteresis
-            cv2.imwrite(str(out_scene_path / "_dbg_02_hysteresis.png"),
-                        mask)
-            # Full-res mask
-            cv2.imwrite(str(out_scene_path / "_dbg_03_mask_full.png"),
-                        mask_full)
-            # Feather visualization
-            soft_vis = (mask_float * 255).astype(np.uint8)
-            cv2.imwrite(str(out_scene_path / "_dbg_04_feather.png"),
-                        soft_vis)
+        for f in iterator:
+            try:
+                if f.result():
+                    processed += 1
+            except Exception as e:
+                if show_progress:
+                    tqdm.write(f"    frame error: {e}")
 
     return processed
 
@@ -422,6 +554,11 @@ def main():
     g.add_argument("--workers", type=int,
                    default=max(1, (os.cpu_count() or 4) // 2),
                    help="Parallel scenes (default: half CPU cores)")
+    g.add_argument("--frame_workers", type=int,
+                   default=max(1, (os.cpu_count() or 4) // 2),
+                   help="Parallel frames per scene (default: half CPU "
+                        "cores). cv2/numpy release the GIL so threads "
+                        "give true concurrency.")
     g.add_argument("--detect_width", type=int, default=960,
                    help="Downscale width for mask computation")
     g.add_argument("--overwrite", action="store_true",
@@ -499,7 +636,8 @@ def main():
     print(f"  Scenes:        {len(scene_dirs)}")
     print(f"  Step:          {args.step}"
           f" ({'all frames' if args.step == 1 else f'fast x{args.step}'})")
-    print(f"  Workers:       {args.workers}")
+    print(f"  Workers:       {args.workers} scenes  x  "
+          f"{args.frame_workers} frames/scene")
     print(f"  Detect width:  {args.detect_width}px")
     print(f"  Thresholds:    T_high={args.t_high}  T_low={args.t_low}")
     print(f"  Min blob area: {args.min_area}px")
